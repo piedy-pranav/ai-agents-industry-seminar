@@ -1,0 +1,306 @@
+TECHNICAL METHODOLOGY
+SeeWeeS Multi-Agent Dispatch System — LangGraph Implementation
+================================================================
+
+
+SECTION 1: ARCHITECTURAL ENHANCEMENTS
+---------------------------------------
+
+The original SeeWeeS prototype was a linear six-node LangGraph pipeline:
+pdf_context → csv_analysis → weather → planner → report → email
+
+It ran in a single pass with no ability to self-correct, handle failures,
+or pause for human oversight. Our implementation rebuilds the backend as a
+non-linear, stateful multi-agent system using LangGraph's full feature set.
+
+
+1.1 Graph Topology
+------------------
+
+Our LangGraph StateGraph has five nodes connected by both direct and
+conditional edges:
+
+  DataAgent → PlannerAgent → AuditAgent ──(conditional)──→ ReportAgent → HumanCheckpoint → END
+                                    ↑                              |
+                                    └──────(retry, up to 3×)──────┘
+
+The graph is compiled with a MemorySaver checkpointer for interactive runs,
+enabling genuine state persistence across the human approval pause.
+
+
+1.2 New Nodes
+-------------
+
+DataAgent
+  Ingests delivery, inventory, driver, and weather data. Detects anomalies
+  using rule-based threshold checks and fills missing weight fields using
+  per-drug historical averages. Calculates a composite data quality score
+  (0–100) based on field completeness across all records.
+
+PlannerAgent
+  Builds dispatch routes by grouping deliveries by region. Prioritizes
+  cold-chain medicines and assigns them exclusively to drivers with
+  cold-chain vehicles. Splits regions exceeding 200 deliveries into
+  sub-zones. On revision runs (triggered by audit failure), borrows
+  available drivers from adjacent regions to resolve assignment gaps.
+
+AuditAgent
+  Validates the PlannerAgent output against five hard safety constraints:
+    (a) Cold-chain compliance — cold medicines must go to cold-chain vehicles
+    (b) Driver hour limits — projected total hours must not exceed 12h
+    (c) Route time cap — no single route may exceed 180 minutes
+    (d) Unassigned critical deliveries — critical routes must have a driver
+    (e) Warehouse capacity — warehouses above 95% usage are flagged
+  Calculates a composite risk score (0–100) as a weighted sum of anomaly
+  counts, violation counts, weather risk, and data quality penalties.
+  Acts as the decision point for the cyclic correction loop.
+
+ReportAgent
+  Calculates six KPIs from the final plan and audit results:
+    — Delivery Delay Risk (% deliveries delayed > 30 min)
+    — Service Level (% deliveries on time)
+    — Resource Utilization (% routes with assigned drivers)
+    — Correction Loops (number of audit retry cycles)
+    — Data Quality (field completeness score)
+    — Composite Risk Score (0–100)
+  Assembles the top risks, ranked recommendations, and full audit trail.
+
+HumanCheckpoint (new — not present in original prototype)
+  A dedicated node placed between ReportAgent and END. When the composite
+  risk score is at or above 65/100, this node calls LangGraph's interrupt()
+  function, which genuinely pauses graph execution and saves the full state
+  to the MemorySaver checkpointer. The graph resumes only when the server
+  receives a manager decision via Command(resume=decision). When risk is
+  below the threshold, the node is a transparent pass-through and does not
+  interrupt execution.
+
+
+1.3 Conditional Edge and Cyclic Correction Loop
+------------------------------------------------
+
+A conditional edge connects AuditAgent to either PlannerAgent (retry) or
+ReportAgent (proceed). The routing function, audit_decision(), reads the
+audit state and returns the next node name:
+
+  — If critical violations remain AND correction count < 3:
+      route back to PlannerAgent
+      (plan.revision is incremented inside AuditAgent so PlannerAgent
+      receives the updated context on the next pass)
+
+  — If correction count reaches 3 and violations still remain:
+      set flow.status = "escalated"
+      route to ReportAgent (report is generated but marked as escalated)
+
+  — If no critical violations remain:
+      route to ReportAgent (normal completion)
+
+Important implementation note: LangGraph passes conditional edge functions
+a read-only snapshot of state, not the live state object. All state
+mutations (incrementing revision, setting escalated status) are made inside
+the AuditAgent node itself before the routing function is called.
+audit_decision() is a pure routing function with no side effects.
+
+The loop is capped at three correction cycles. On each retry, PlannerAgent
+receives the previous violations via state.plan.revisionReasons and applies
+progressively more aggressive reallocation (cross-region driver borrowing,
+priority-based batch splitting).
+
+
+1.4 Human-in-the-Loop Using LangGraph interrupt()
+--------------------------------------------------
+
+Enhancement #4 from the project specification is implemented using
+LangGraph's native interrupt() primitive rather than a simple flag.
+
+Flow:
+  1. run_cycle_hitl() generates a unique thread_id and invokes the graph
+     with a MemorySaver-backed config:
+       config = {"configurable": {"thread_id": thread_id}}
+
+  2. When HumanCheckpoint calls interrupt(), LangGraph raises a NodeInterrupt
+     internally, saves the complete accumulated state to the MemorySaver,
+     and returns control to the caller. The graph is paused mid-execution.
+
+  3. The server detects the pause by checking:
+       graph.get_state(config).next  →  non-empty means interrupted
+
+  4. The API response includes awaitingApproval: true and the thread_id.
+     The dashboard renders the full report alongside Approve / Reject buttons.
+
+  5. On manager action, the client posts to /api/approve. The server calls:
+       graph.invoke(Command(resume=decision), config=config)
+     This resumes the graph from the exact checkpoint where it paused.
+
+  6. HumanCheckpoint receives the decision string, updates
+     audit.humanDecision and flow.status, and the graph completes normally.
+
+A hitl_enabled flag in flow state ensures that stateless runs (CLI, upload,
+what-if comparison) skip the interrupt() call entirely, since those contexts
+have no checkpointer attached and cannot persist state for resumption.
+
+
+1.5 What-If Scenario Simulation
+--------------------------------
+
+Six named disruption scenarios are defined in simulator/data_generator.py.
+Each scenario modifies the data generation parameters before the graph runs:
+
+  Normal          — Baseline, no disruptions
+  Demand Surge    — Region A delivery volume multiplied by 1.4
+  Warehouse Closure — Warehouse D set to non-operational, capacity at 100%
+  Driver Shortage — 30% of drivers set to unavailable status
+  Severe Weather  — Regions B and C assigned storm/snow conditions,
+                    risk level set to high
+  Compound Crisis — Demand surge in Region A + 20% driver shortage +
+                    severe weather in Region C
+
+The dashboard's Compare All mode runs all six scenarios sequentially and
+returns a unified results array for side-by-side bar chart comparison of
+risk scores, service levels, and correction loop counts.
+
+
+================================================================
+
+
+SECTION 2: AGENT DESIGN
+--------------------------
+
+Each agent follows a hybrid architecture: deterministic rule-based logic
+handles all constraint checks, calculations, and assignments, while an LLM
+layer adds contextual reasoning and executive-quality language on top.
+The pipeline never depends on the LLM for correctness — if no API key is
+configured or a rate limit is hit, every agent still produces a valid output.
+
+
+2.1 LLM Provider and Model
+---------------------------
+
+Primary:  Groq — qwen/qwen3-32b
+Fallback: Anthropic — claude-haiku-4-5-20251001
+
+The LLM wrapper (core/llm.py) tries Groq first. On any failure (rate limit,
+auth error, timeout) it falls back to Claude automatically. If neither key
+is available, call_llm() returns an empty string and the agent continues
+with its rule-based output unchanged.
+
+Qwen3 models emit <think>...</think> chain-of-thought blocks and sometimes
+append word-count compliance notes to their responses. Both are stripped
+with regex before the text reaches any agent or the dashboard.
+
+
+2.2 DataAgent — Data Quality Reasoning
+----------------------------------------
+
+Rule-based layer:
+  Iterates over all delivery records and fills any missing weight field
+  using a lookup table of average kg-per-unit by drug type:
+    Insulin: 0.05 kg/unit   Vaccines: 0.03 kg/unit
+    Antibiotics: 0.08       Blood Products: 0.25
+    Chemotherapy Drugs: 0.15   Default: 0.10
+  Augmented records are flagged (_augmented: true) and excluded from the
+  data quality score. Anomalies are detected across four categories:
+  delivery delays above 60 minutes, warehouse offline or above 90% capacity,
+  driver availability below 30% in a region, and high weather risk.
+
+LLM layer (prompt: DATA_QUALITY_SYSTEM + DATA_QUALITY_USER):
+  After rule-based detection completes, the top ten anomalies and the data
+  quality score are sent to the LLM with this instruction structure:
+
+    System: You are a data quality analyst for SeeWeeS, a specialty
+    pharmaceutical distribution company...
+
+    User: [quality score, delivery count, augmented count, anomaly list]
+    Respond in exactly three sections:
+      1. ROOT CAUSE (1-2 sentences)
+      2. PLANNING CONFIDENCE (High/Medium/Low + 1 sentence explanation)
+      3. DATA ACTION (1 bullet point)
+
+  The LLM response is stored in state.data.llm_assessment and displayed
+  in the dashboard's executive summary panel.
+
+
+2.3 AuditAgent — Correction Guidance
+--------------------------------------
+
+Rule-based layer:
+  Checks the five safety constraints described in Section 1.2. Calculates
+  the composite risk score using this weighting formula:
+    critical anomalies × 12
+    critical violations × 15
+    warning violations × 5
+    high-risk weather regions × 10
+    data quality below 80% → +10 flat penalty
+    unassigned routes × 8
+  Score is capped at 100.
+
+LLM layer (prompt: AUDIT_CORRECTION_SYSTEM + AUDIT_CORRECTION_USER):
+  Called only when violations are present and the plan has not passed.
+  The prompt provides the full list of critical and warning violations and
+  asks for numbered, route-specific correction steps:
+
+    System: You are a compliance officer for SeeWeeS medical deliveries.
+    When the automated dispatch plan violates safety rules, you write
+    precise, numbered correction steps that the routing system can execute
+    immediately...
+
+    User: [revision number, critical violations list, warning violations list]
+    Write numbered correction steps (max 4) that directly resolve the
+    critical violations. Name specific route IDs or driver IDs. Under 120 words.
+
+  The LLM response is stored in state.audit.llm_correction_guidance and
+  appears in the audit trail shown on the dashboard.
+
+
+2.4 ReportAgent — Executive Narrative
+---------------------------------------
+
+Rule-based layer:
+  Computes all six KPIs from the final state. Assembles top risks by
+  combining critical anomalies (up to 3), critical violations (up to 2),
+  and a contingency count entry if applicable. Generates templated
+  recommendations based on which anomaly types were detected (driver
+  shortage → cross-region reassignment, weather → contingency activation,
+  capacity → overflow protocol, low data quality → pipeline investigation).
+
+LLM layer (prompt: EXECUTIVE_SUMMARY_SYSTEM + EXECUTIVE_SUMMARY_USER):
+  The six KPI values, status, top risks, and top recommendations are
+  passed to the LLM with a strict three-paragraph structure:
+
+    System: You are writing a daily operations briefing for the C-suite
+    of SeeWeeS, a medical logistics company. Be direct. Lead with the
+    most important fact. Use plain language.
+
+    User: [cycle ID, status, all six KPIs, top risks, top recommendations]
+    Paragraph 1 — Situation: overall status and the single most important number
+    Paragraph 2 — Risk: the biggest risk and what drives it
+    Paragraph 3 — Action: what leadership must decide or do today
+    Max 120 words total.
+
+  The LLM narrative replaces the rule-assembled summary string in
+  state.report.summary. If the LLM call fails, the rule-assembled
+  summary is used as the fallback with no visible error to the user.
+
+
+2.5 PlannerAgent — No LLM (by design)
+---------------------------------------
+
+The PlannerAgent uses no LLM call. Route assignment, cold-chain matching,
+region splitting, and driver allocation are deterministic constraint
+satisfaction problems where rule-based logic is more reliable and
+auditable than LLM inference. The AuditAgent's LLM correction guidance
+provides the human-readable explanation of what the planner needs to fix,
+keeping the reasoning visible without introducing non-determinism into the
+assignment itself.
+
+
+2.6 HumanCheckpoint — No LLM (by design)
+------------------------------------------
+
+The checkpoint node is a pure control-flow node. Its only job is to call
+interrupt() or pass through. The full report (including all LLM-generated
+text from ReportAgent) is already in state by the time HumanCheckpoint
+runs, so the manager reviewing the dashboard sees the complete AI-generated
+executive summary before making the approval decision.
+
+
+================================================================

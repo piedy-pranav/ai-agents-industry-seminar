@@ -8,9 +8,10 @@ A multi-agent medical logistics dispatch system built on **LangGraph** with **Gr
 
 > **Requirements:** Python 3.11+ and a free Groq API key ([console.groq.com](https://console.groq.com))
 
-**1. Clone and enter the folder**
+**1. Clone the repository**
 ```bash
-cd lngrph-implementation
+git clone https://github.com/piedy-pranav/ai-agents-industry-seminar.git
+cd ai-agents-industry-seminar
 ```
 
 **2. Create a virtual environment and install dependencies**

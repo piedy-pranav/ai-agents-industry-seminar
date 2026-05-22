@@ -178,3 +178,15 @@ requirements.txt      — All Python dependencies
 | `GROQ_API_KEY` | Recommended | Primary LLM. Free tier at [console.groq.com](https://console.groq.com) |
 | `ANTHROPIC_API_KEY` | Optional | Fallback LLM if Groq hits a rate limit |
 | `PORT` | Optional | Server port (default: 3200) |
+
+## Rate Limit Note (Groq Free Tier)
+
+The Groq free tier for `qwen/qwen3-32b` has a limit of **6,000 tokens per minute**. Each scenario run makes 2–3 LLM calls and uses roughly 1,000–2,000 tokens total.
+
+**Recommended:**
+- Wait **~60 seconds between individual scenario runs** to stay within the per-minute limit
+- The **Compare All** mode runs all 6 scenarios in sequence — wait at least **2 minutes** before using it after any prior run, as it uses the most tokens in one shot
+
+**If you do hit the rate limit:** the pipeline does not crash. LLM calls are skipped silently and the system falls back to its rule-based output — KPIs, risk scores, audit trail, and recommendations all still appear correctly. Only the AI-generated narrative sections (executive summary, data quality assessment) will be empty. Wait 60 seconds and re-run to get the full LLM output.
+
+If rate limits are a repeated issue, add an `ANTHROPIC_API_KEY` to `.env` — the system will automatically fall back to Claude for any call that Groq cannot serve.

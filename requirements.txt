@@ -1,0 +1,19 @@
+# Core LangGraph stack
+langgraph>=0.2.0
+langchain-core>=0.2.0
+
+# LLM providers (Groq primary, Claude fallback)
+langchain-groq>=0.1.0
+langchain-anthropic>=0.1.0
+
+# API server (replaces Express)
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# Data handling
+pandas>=2.2.0
+openpyxl>=3.1.0       # Excel support
+
+# Environment
+python-dotenv>=1.0.0

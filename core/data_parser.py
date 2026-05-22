@@ -2,8 +2,8 @@
 Data parser — converts uploaded CSV / Excel / JSON files into the four
 system data structures (deliveries, inventory, drivers, weather).
 
-Supports flexible column names in English and Chinese. Logic is a direct
-port of core/data-parser.mjs.
+Supports flexible column names via alias maps (case-insensitive,
+punctuation-insensitive). Logic is a direct port of core/data-parser.mjs.
 """
 
 import io

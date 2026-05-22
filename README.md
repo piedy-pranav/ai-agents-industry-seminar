@@ -25,7 +25,9 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
-Open `.env` and replace `your_groq_api_key_here` with your key from [console.groq.com](https://console.groq.com). The system works without a key (LLM calls are skipped gracefully) but you will not see AI-generated summaries.
+Open the newly created `.env` file (not `.env.example`) and replace `your_groq_api_key_here` with your key from [console.groq.com](https://console.groq.com). The system reads keys from `.env` at startup — `.env.example` is only a reference template and is never read at runtime.
+
+The system works without a key (LLM calls are skipped gracefully) but you will not see AI-generated summaries.
 
 **4. Start the server**
 ```bash
